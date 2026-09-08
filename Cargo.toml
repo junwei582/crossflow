@@ -125,7 +125,7 @@ pyo3-async-runtimes = { workspace = true, optional = true, features = ["async-st
 pythonize = { workspace = true, optional = true }
 
 # --- Dependencies for grpc feature
-tonic = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true, features = ["tls-ring"] }
 prost = { workspace = true, optional = true }
 tonic-prost = { workspace = true, optional = true }
 prost-reflect = { workspace = true, features = ["serde"], optional = true }

@@ -480,7 +480,7 @@ let mut registry = DiagramElementRegistry::new();
 //
 // This will add gRPC node builders to the registry.
 let rt = Arc::new(Runtime::new().unwrap());
-registry.enable_grpc(Arc::clone(&rt));
+registry.enable_grpc(Arc::clone(&rt), None);
 
 // Run the tokio runtime on a separate thread.
 //

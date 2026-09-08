@@ -30,7 +30,7 @@ use std::{
 
 use anyhow::anyhow;
 
-use http::uri::PathAndQuery;
+use http::uri::{PathAndQuery, Scheme, Uri};
 
 use futures::{FutureExt, Stream as FutureStream, stream::once};
 use futures_lite::future::race;
@@ -44,7 +44,7 @@ use tonic::{
     client::Grpc as Client,
     codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder},
     codegen::tokio_stream::wrappers::UnboundedReceiverStream,
-    transport::Channel,
+    transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity},
 };
 
 use schemars::JsonSchema;
@@ -71,6 +71,32 @@ pub struct GrpcConfig {
     /// cancelling it. This is optional. Leaving it unset will allow the client to
     /// wait indefinitely.
     pub timeout: Option<f64>,
+}
+
+/// TLS material for every `https://` gRPC node in the registry. The app reads
+/// the files and passes the PEM bytes here.
+#[derive(Clone)]
+pub struct GrpcTlsSettings {
+    /// The CA that signed the server certificates.
+    pub ca_cert_pem: Vec<u8>,
+    /// Host name the server certificate is checked against. Defaults to the URI host.
+    pub domain_name: Option<String>,
+    /// Client certificate and key for mTLS. None for one-way TLS.
+    pub identity_pem: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+impl From<GrpcTlsSettings> for ClientTlsConfig {
+    fn from(settings: GrpcTlsSettings) -> Self {
+        let mut tls =
+            ClientTlsConfig::new().ca_certificate(Certificate::from_pem(settings.ca_cert_pem));
+        if let Some(name) = settings.domain_name {
+            tls = tls.domain_name(name);
+        }
+        if let Some((cert, key)) = settings.identity_pem {
+            tls = tls.identity(Identity::from_pem(cert, key));
+        }
+        tls
+    }
 }
 
 #[derive(StreamPack)]
@@ -128,7 +154,9 @@ impl DiagramElementRegistry {
     /// //
     /// // This will add gRPC node builders to the registry.
     /// let rt = Arc::new(Runtime::new().unwrap());
-    /// registry.enable_grpc(Arc::clone(&rt));
+    ///
+    /// // Pass `Some(GrpcTlsSettings { .. })` to allow `https://` URIs.
+    /// registry.enable_grpc(Arc::clone(&rt), None);
     ///
     /// // Run the tokio runtime on a separate thread.
     /// //
@@ -140,8 +168,11 @@ impl DiagramElementRegistry {
     ///     let _ = rt.block_on(exit_receiver);
     /// });
     /// ```
-    pub fn enable_grpc(&mut self, runtime: Arc<Runtime>) {
+    pub fn enable_grpc(&mut self, runtime: Arc<Runtime>, tls: Option<GrpcTlsSettings>) {
+        let tls: Option<ClientTlsConfig> = tls.map(Into::into);
+
         let rt = Arc::clone(&runtime);
+        let tls_for_request = tls.clone();
         self.opt_out()
             .no_serializing()
             .no_deserializing()
@@ -154,8 +185,8 @@ impl DiagramElementRegistry {
                         path,
                     } = get_descriptions(&config)?;
 
-                    let uri: Box<[u8]> = config.uri.as_bytes().into();
-                    let client = make_client(uri).shared();
+                    let endpoint = make_endpoint(&config.uri, tls_for_request.as_ref())?;
+                    let client = connect(endpoint).shared();
                     let is_server_streaming = method.is_server_streaming();
                     let path = PathAndQuery::from_maybe_shared(path.clone())?;
 
@@ -212,8 +243,8 @@ impl DiagramElementRegistry {
                         path,
                     } = get_descriptions(&config)?;
 
-                    let uri: Box<[u8]> = config.uri.as_bytes().into();
-                    let client = make_client(uri).shared();
+                    let endpoint = make_endpoint(&config.uri, tls.as_ref())?;
+                    let client = connect(endpoint).shared();
                     let is_server_streaming = method.is_server_streaming();
                     let path = PathAndQuery::from_maybe_shared(path.clone())?;
 
@@ -292,13 +323,30 @@ struct GrpcDescriptions {
     path: String,
 }
 
-async fn make_client(uri: Box<[u8]>) -> Result<Client<Channel>, String> {
-    let channel = Channel::from_shared(uri)
-        .map_err(|e| format!("invalid uri for service: {e}"))?
+/// Decides TLS at build time from the URI scheme. `https` needs `tls`, `http`
+/// ignores it.
+fn make_endpoint(uri: &str, tls: Option<&ClientTlsConfig>) -> Result<Endpoint, Anyhow> {
+    let uri: Uri = uri
+        .parse()
+        .map_err(|e| anyhow!("invalid uri for service: {e}"))?;
+    let endpoint = Channel::builder(uri.clone());
+    if uri.scheme() != Some(&Scheme::HTTPS) {
+        return Ok(endpoint);
+    }
+    let tls =
+        tls.ok_or_else(|| anyhow!("uri {uri} is https but enable_grpc was given no TLS settings"))?;
+    endpoint
+        .tls_config(tls.clone())
+        .map_err(|e| Anyhow::new(e).context("failed to apply TLS config"))
+}
+
+async fn connect(endpoint: Endpoint) -> Result<Client<Channel>, String> {
+    // Debug form, because tonic's Display is just "transport error".
+    let channel = endpoint
         .connect()
         .await
-        .map_err(|e| format!("failed to connect: {e}"))?;
-    Ok::<_, String>(Client::new(channel))
+        .map_err(|e| format!("failed to connect: {e:?}"))?;
+    Ok(Client::new(channel))
 }
 
 fn get_descriptions(config: &GrpcConfig) -> Result<GrpcDescriptions, Anyhow> {
@@ -558,7 +606,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        fixture.registry.enable_grpc(Arc::clone(&rt));
+        fixture.registry.enable_grpc(Arc::clone(&rt), None);
 
         let (exit_sender, exit_receiver) = tokio::sync::oneshot::channel();
         std::thread::spawn(move || {
@@ -599,6 +647,79 @@ mod tests {
         let _ = exit_sender.send(());
     }
 
+    fn load_test_descriptors() {
+        let descriptor_set_bytes =
+            include_bytes!(concat!(env!("OUT_DIR"), "/file_descriptor_set.bin"));
+        DescriptorPool::decode_global_file_descriptor_set(&descriptor_set_bytes[..]).unwrap();
+    }
+
+    fn test_tls_settings() -> GrpcTlsSettings {
+        GrpcTlsSettings {
+            ca_cert_pem: include_bytes!("grpc_test_certs/ca.pem").to_vec(),
+            domain_name: None,
+            identity_pem: None,
+        }
+    }
+
+    #[test]
+    fn test_grpc_unary_request_over_tls() {
+        load_test_descriptors();
+
+        let mut fixture = DiagramTestFixture::new();
+        let port = 50000 + line!();
+        let addr = format!("[::1]:{port}").parse().unwrap();
+
+        let rt = Arc::new(Runtime::new().unwrap());
+        rt.spawn(async move {
+            let identity = Identity::from_pem(
+                include_bytes!("grpc_test_certs/server.pem"),
+                include_bytes!("grpc_test_certs/server.key"),
+            );
+            Server::builder()
+                .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))
+                .unwrap()
+                .add_service(FibonacciServer::new(GenerateFibonacci))
+                .serve(addr)
+                .await
+                .unwrap();
+        });
+        fixture
+            .registry
+            .enable_grpc(Arc::clone(&rt), Some(test_tls_settings()));
+
+        let (exit_sender, exit_receiver) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = rt.block_on(exit_receiver);
+        });
+
+        let diagram = Diagram::from_json(json!({
+            "version": "0.1.0",
+            "start": "fibonacci",
+            "ops": {
+                "fibonacci": {
+                    "type": "node",
+                    "builder": "grpc_request",
+                    "config": {
+                        "service": "example_protos.fibonacci.Fibonacci",
+                        "method": "FinalNumber",
+                        "uri": format!("https://localhost:{port}"),
+                    },
+                    "stream_out": {
+                        "out": { "builtin": "terminate" }
+                    },
+                    "next": { "builtin": "terminate" }
+                }
+            }
+        }))
+        .unwrap();
+        let result: JsonMessage = fixture
+            .spawn_and_run_with_conditions(&diagram, json!({ "order": 10 }), Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(result["value"].as_u64().unwrap(), 55);
+
+        let _ = exit_sender.send(());
+    }
+
     #[test]
     fn test_grpc_service_streaming() {
         let descriptor_set_bytes =
@@ -617,7 +738,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        fixture.registry.enable_grpc(Arc::clone(&rt));
+        fixture.registry.enable_grpc(Arc::clone(&rt), None);
 
         let (exit_sender, exit_receiver) = tokio::sync::oneshot::channel();
         std::thread::spawn(move || {
@@ -716,7 +837,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        fixture.registry.enable_grpc(Arc::clone(&rt));
+        fixture.registry.enable_grpc(Arc::clone(&rt), None);
 
         let (exit_sender, exit_receiver) = tokio::sync::oneshot::channel();
         std::thread::spawn(move || {
