@@ -71,6 +71,10 @@ pub struct GrpcConfig {
     /// cancelling it. This is optional. Leaving it unset will allow the client to
     /// wait indefinitely.
     pub timeout: Option<f64>,
+    /// Fixed request to send on every activation. When set, the upstream input
+    /// is ignored. Leave unset to send the upstream input as the request.
+    /// Only `grpc_request` supports this.
+    pub request: Option<JsonMessage>,
 }
 
 /// TLS material for every `https://` gRPC node in the registry. The app reads
@@ -177,7 +181,13 @@ impl DiagramElementRegistry {
             .no_serializing()
             .no_deserializing()
             .register_node_builder_fallible(
-                NodeBuilderOptions::new("grpc_request").with_default_display_text("gRPC Request"),
+                NodeBuilderOptions::new("grpc_request")
+                    .with_default_display_text("gRPC Request")
+                    .with_description(
+                        "Make a unary or server-streaming gRPC call. If `request` is set in \
+                         config it is sent on every activation and the upstream input is \
+                         ignored. Otherwise the upstream input is the request.",
+                    ),
                 move |builder, config: GrpcConfig| {
                     let GrpcDescriptions {
                         method,
@@ -195,6 +205,7 @@ impl DiagramElementRegistry {
                         let client = client.clone();
                         let codec = codec.clone();
                         let path = path.clone();
+                        let request = config.request.clone().unwrap_or(input.request);
 
                         // The tonic gRPC client needs to be run inside a tokio
                         // async runtime, so we spawn a tokio task here and use the
@@ -204,7 +215,6 @@ impl DiagramElementRegistry {
                                 let client = client.await?;
 
                                 // Convert the request message into a stream of a single dynamic message
-                                let request = input.request;
                                 let request = Request::new(once(async move { request }));
                                 execute(
                                     request,
@@ -235,8 +245,20 @@ impl DiagramElementRegistry {
             .no_deserializing()
             .no_cloning()
             .register_node_builder_fallible(
-                NodeBuilderOptions::new("grpc_client").with_default_display_text("gRPC Client"),
+                NodeBuilderOptions::new("grpc_client")
+                    .with_default_display_text("gRPC Client")
+                    .with_description(
+                        "Open a client-streaming or bidirectional gRPC call. The upstream \
+                         input stream is the request stream. `request` in config is not \
+                         supported here.",
+                    ),
                 move |builder, config: GrpcConfig| {
+                    if config.request.is_some() {
+                        return Err(anyhow!(
+                            "`request` is not supported on grpc_client. The input stream is the request."
+                        ));
+                    }
+
                     let GrpcDescriptions {
                         method,
                         codec,
@@ -716,6 +738,58 @@ mod tests {
             .spawn_and_run_with_conditions(&diagram, json!({ "order": 10 }), Duration::from_secs(2))
             .unwrap();
         assert_eq!(result["value"].as_u64().unwrap(), 55);
+
+        let _ = exit_sender.send(());
+    }
+
+    #[test]
+    fn test_grpc_config_request_overrides_input() {
+        load_test_descriptors();
+
+        let mut fixture = DiagramTestFixture::new();
+        let port = 50000 + line!();
+        let addr = format!("[::1]:{port}").parse().unwrap();
+
+        let rt = Arc::new(Runtime::new().unwrap());
+        rt.spawn(async move {
+            Server::builder()
+                .add_service(FibonacciServer::new(GenerateFibonacci))
+                .serve(addr)
+                .await
+                .unwrap();
+        });
+        fixture.registry.enable_grpc(Arc::clone(&rt), None);
+
+        let (exit_sender, exit_receiver) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = rt.block_on(exit_receiver);
+        });
+
+        let diagram = Diagram::from_json(json!({
+            "version": "0.1.0",
+            "start": "fibonacci",
+            "ops": {
+                "fibonacci": {
+                    "type": "node",
+                    "builder": "grpc_request",
+                    "config": {
+                        "service": "example_protos.fibonacci.Fibonacci",
+                        "method": "FinalNumber",
+                        "uri": format!("http://localhost:{port}"),
+                        "request": { "order": 5 },
+                    },
+                    "stream_out": {
+                        "out": { "builtin": "terminate" }
+                    },
+                    "next": { "builtin": "terminate" }
+                }
+            }
+        }))
+        .unwrap();
+        let result: JsonMessage = fixture
+            .spawn_and_run_with_conditions(&diagram, json!({ "order": 10 }), Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(result["value"].as_u64().unwrap(), 5);
 
         let _ = exit_sender.send(());
     }
