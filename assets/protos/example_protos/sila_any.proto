@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+// Minimal stand-in for SiLAFramework.proto, used to test SiLA Any encoding.
+// The package and message names must match the real thing: the encoder keys
+// off the full name "sila2.org.silastandard.Any".
+package sila2.org.silastandard;
+
+message String {
+    string value = 1;
+}
+
+message Any {
+    string type = 1;
+    bytes payload = 2;
+}
+
+// Exercises every place an Any can sit: direct, repeated, map value, nested.
+message AnyHolder {
+    String name = 1;
+    Any payload = 2;
+    repeated Any items = 3;
+    map<string, Any> named = 4;
+    AnyHolder child = 5;
+    string plain = 6;
+}
+
+// Returns the request unchanged, so a test can send Any fields through a real
+// gRPC call in both directions.
+service AnyEcho {
+    rpc Echo (AnyHolder) returns (AnyHolder);
+}

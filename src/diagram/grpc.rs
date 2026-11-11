@@ -15,6 +15,8 @@
  *
 */
 
+mod sila_any;
+
 use super::*;
 use crate::{Async, Identifier, NeverFinish};
 
@@ -512,7 +514,8 @@ struct DynamicMessageCodec {
 impl Encoder for DynamicMessageCodec {
     type Item = JsonMessage;
     type Error = Status;
-    fn encode(&mut self, item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
+    fn encode(&mut self, mut item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
+        sila_any::pack_any_fields(&self.descriptor, &mut item);
         let msg = DynamicMessage::deserialize(self.descriptor.clone(), item)
             .map_err(|e| Status::new(Code::InvalidArgument, format!("{e}")))?;
 
@@ -533,7 +536,7 @@ impl Decoder for DynamicMessageCodec {
         let msg = DynamicMessage::decode(self.descriptor.clone(), src)
             .map_err(|e| Status::new(Code::DataLoss, format!("failed to decode message: {e}")))?;
 
-        let value = msg
+        let mut value = msg
             .serialize_with_options(
                 serde_json::value::Serializer,
                 &SerializeOptions::new()
@@ -543,6 +546,7 @@ impl Decoder for DynamicMessageCodec {
             )
             .map_err(|e| Status::new(Code::DataLoss, format!("failed to convert to json: {e}")))?;
 
+        sila_any::unpack_any_fields(&self.descriptor, &mut value);
         Ok(Some(value))
     }
 }

@@ -46,7 +46,16 @@ As mentioned [above](#descriptor-pool) whatever service type that you configure 
 **Request** --- The `grpc_request` nodes take in a single [`JsonMessage`] which will be used as the single request message sent to the server.
 Each [`JsonMessage`] sent in activates a new gRPC client←→server session where the server will receive this single request.
 The gRPC client itself is instantiated when the workflow is originally built, and will be reused for all requests sent into this node.
+
 Separate sessions of the workflow will also use the same gRPC client whenever the same node is activated.
+
+**SiLA `Any` fields** --- If the request message has a field of type `sila2.org.silastandard.Any`, you can write a plain JSON value there and the node packs it for you.
+An object becomes a SiLA Key/Value map, an array a list of `Any`, and each scalar the matching basic type (`String`, `Integer`, `Real`, `Boolean`, or Void for `null`).
+SiLA has no map type, so the server must apply the same Key/Value convention to read an object back.
+A value that already has the shape `{"type": "<xml>", "payload": "<base64>"}` is sent as-is, so pre-packed payloads keep working.
+Response messages are unpacked the same way, so an `Any` in a reply arrives as plain JSON that a later node can read by field name.
+Replies may also carry a named `Structure`, which reads back as an object keyed by the element identifiers in its type description.
+An `Any` whose type description this node cannot read is left as `{"type": ..., "payload": ...}` rather than dropped.
 
 **"out"** --- The response messages received from the gRPC server will be sent out of the stream named `"out"`.
 This is the case whether the service is unary or server-streaming.
